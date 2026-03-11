@@ -31,7 +31,16 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["url"],
         },
       },
-{
+      {
+        name: "click_element",
+        description: "点击页面上的某个元素（使用 CSS 选择器）",
+        inputSchema: {
+          type: "object" as const,
+          properties: { selector: { type: "string" } },
+          required: ["selector"],
+        },
+      },
+      {
         name: "get_page_content",
         description: "获取当前页面的纯文本内容，用于分析页面状态",
         inputSchema: {
@@ -49,12 +58,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "click_by_id",
-        description: "通过数字 ID 点击页面元素。在单次浏览器执行中完成：清理标注 → 定位元素 → 探针检测遮挡 → 执行点击。如果元素被遮挡会返回阻挡者信息，请根据信息决定下一步操作（如先关闭弹窗）。⚠️ ID 必须来自最近一次 get_interactive_tree 的结果。",
+        description: "通过数字 ID 点击页面元素。⚠️ 警告：绝对不要凭空猜测 ID！传入的 ID 必须是你刚刚通过 get_interactive_tree 工具获取到的最新列表中的有效数字。",
         inputSchema: {
           type: "object" as const,
-          properties: {
-            id: { type: "number", description: "get_interactive_tree 返回的元素编号" },
-          },
+          properties: { id: { type: "number", description: "get_interactive_tree 返回的元素编号" } },
           required: ["id"],
         },
       },
@@ -70,7 +77,32 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["id", "text"],
         },
       },
-{
+      {
+        name: "smart_click",
+        description: "通过可见文本点击页面元素。支持用 role 缩小匹配范围（如 button、link）。如果有多个匹配项会返回列表，需传 index 指定点击哪一个。",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            text: { type: "string", description: "元素上的可见文字" },
+            role: { type: "string", description: "(可选) ARIA role，如 button、link、checkbox、textbox、heading 等。不传则按纯文本匹配。" },
+            exact: { type: "boolean", description: "是否精确匹配文本，默认 false" },
+            index: { type: "number", description: "(可选) 多个匹配时指定第几个，从 0 开始" },
+          },
+          required: ["text"],
+        },
+      },
+      {
+        name: "find_text_and_scroll",
+        description: "在网页中查找指定文本，自动将其滚动到屏幕中央，并返回该元素的交互信息。适用于页面内容较多、需要定位特定文字的场景。",
+        inputSchema: {
+          type: "object" as const,
+          properties: {
+            text: { type: "string", description: "需要查找的文本片段，如 '前端开发' 或 '立即沟通'" },
+          },
+          required: ["text"],
+        },
+      },
+      {
         name: "scroll_page",
         description: "向下滚动当前页面，专门用于触发懒加载/无限滚动以获取新数据。⚠️ 调用后必须重新调用 get_interactive_tree 获取最新元素，因为 DOM 已更新。",
         inputSchema: {
@@ -185,7 +217,14 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       };
     }
 
-if (name === "get_page_content") {
+    if (name === "click_element") {
+      await page.click(args!.selector as string);
+      return {
+        content: [{ type: "text" as const, text: `已点击元素: ${args!.selector}` }],
+      };
+    }
+
+    if (name === "get_page_content") {
       const text = await page.evaluate(() => document.body.innerText);
       return {
         content: [{ type: "text" as const, text: `页面内容:\n${text.substring(0, 5000)}` }],
@@ -328,92 +367,63 @@ if (name === "get_page_content") {
 
     if (name === "click_by_id") {
       const id = args!.id as number;
-
-      // 单次 evaluate：清理标注 → 定位 → 滚动 → 探针检测 → 返回坐标
-      const result = await page.evaluate((targetId: number) => {
-        // 穿透 Shadow DOM / iframe 查找 data-ai-id
-        function findByAiId(root: Document | ShadowRoot): Element | null {
-          const el = root.querySelector(`[data-ai-id="${targetId}"]`);
-          if (el) return el;
-          for (const node of root.querySelectorAll('*')) {
-            if (node.shadowRoot) {
-              const r = findByAiId(node.shadowRoot);
-              if (r) return r;
-            }
-            if (node.tagName.toLowerCase() === 'iframe') {
-              const doc = (node as HTMLIFrameElement).contentDocument;
-              if (doc) {
-                const r = findByAiId(doc);
-                if (r) return r;
+      try {
+        // 第一步：在浏览器内定位元素并滚动到可见区域
+        const found = await page.evaluate((targetId: number) => {
+          function findByAiId(root: Document | ShadowRoot): Element | null {
+            const el = root.querySelector(`[data-ai-id="${targetId}"]`);
+            if (el) return el;
+            for (const node of root.querySelectorAll('*')) {
+              if (node.shadowRoot) {
+                const result = findByAiId(node.shadowRoot);
+                if (result) return result;
+              }
+              if (node.tagName.toLowerCase() === 'iframe') {
+                const doc = (node as HTMLIFrameElement).contentDocument;
+                if (doc) {
+                  const result = findByAiId(doc);
+                  if (result) return result;
+                }
               }
             }
+            return null;
           }
-          return null;
+          const el = findByAiId(document);
+          if (!el) return false;
+          el.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+          return true;
+        }, id);
+
+        if (found) {
+          // 等待滚动和渲染稳定
+          await page.waitForTimeout(150);
+
+          // 第二步：重新获取坐标（确保滚动后位置准确）
+          const coords = await page.evaluate((targetId: number) => {
+            const el = document.querySelector(`[data-ai-id="${targetId}"]`);
+            if (!el) return null;
+            const rect = (el as HTMLElement).getBoundingClientRect();
+            return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
+          }, id);
+
+          if (coords) {
+            // 第三步：用 Playwright 真实鼠标点击（isTrusted = true）
+            await page.mouse.click(coords.x, coords.y);
+            return {
+              content: [{ type: "text" as const, text: `已成功点击元素 [${id}]` }],
+            };
+          }
         }
-
-        // 1. 清理 AI 标注框
-        document.querySelectorAll('.ai-highlight-box').forEach(b => b.remove());
-
-        // 2. 查找目标元素
-        const el = findByAiId(document);
-        if (!el) return { status: 'not_found' as const };
-
-        // 3. 滚动到可见区域（instant 保证同步完成，getBoundingClientRect 立即可靠）
-        el.scrollIntoView({ block: 'center', behavior: 'instant' });
-
-        // 4. 获取中心坐标
-        const rect = (el as HTMLElement).getBoundingClientRect();
-        const cx = rect.x + rect.width / 2;
-        const cy = rect.y + rect.height / 2;
-
-        // 5. 探针检测：检查该坐标最顶层元素是否就是目标（或其父/子）
-        const topEl = document.elementFromPoint(cx, cy);
-        const probePass = !topEl || topEl === el || topEl.contains(el) || el.contains(topEl);
-
-        let blockerInfo: string | undefined;
-        if (!probePass && topEl) {
-          const tag = topEl.tagName.toLowerCase();
-          const cls = topEl.className?.toString().slice(0, 60) || '';
-          const txt = (topEl as HTMLElement).innerText?.trim().slice(0, 50) || '';
-          blockerInfo = `<${tag} class="${cls}"> text="${txt}"`;
-        }
-
-        // 6. 无论是否被遮挡，都用 el.click() 直接点击目标（穿透遮挡，不破坏 DOM）
-        (el as HTMLElement).click();
-
         return {
-          status: 'clicked' as const,
-          probePass,
-          blockerInfo,
-          coords: { x: cx, y: cy },
-          tag: el.tagName.toLowerCase(),
-          text: (el as HTMLElement).innerText?.trim().slice(0, 30) || '',
+          content: [{ type: "text" as const, text: `点击失败: 找不到 ID 为 ${id} 的元素。请重新获取页面元素树。` }],
+          isError: true,
         };
-      }, id);
-
-      // 处理结果
-      if (result.status === 'not_found') {
+      } catch {
         return {
-          content: [{ type: "text" as const, text: `点击失败：找不到 ID 为 ${id} 的元素。SPA 可能已重渲染，请重新调用 get_interactive_tree。` }],
+          content: [{ type: "text" as const, text: `点击失败: 找不到 ID 为 ${id} 的元素。请重新获取页面元素树。` }],
           isError: true,
         };
       }
-
-      // el.click() 已执行；如果探针通过，补发物理点击加强
-      if (result.probePass && result.coords) {
-        const { x, y } = result.coords;
-        await page.mouse.move(x, y, { steps: 5 });
-        await page.waitForTimeout(50);
-        await page.mouse.down();
-        await page.waitForTimeout(50);
-        await page.mouse.up();
-      }
-
-      const url = page.url();
-      const probeNote = result.probePass ? '' : `\n⚠️ 探针检测到遮挡层: ${result.blockerInfo}，已通过 el.click() 穿透点击。`;
-      return {
-        content: [{ type: "text" as const, text: `✅ 已点击 <${result.tag}> "${result.text}" [${id}]。当前页面: ${url}${probeNote}` }],
-      };
     }
 
     if (name === "type_by_id") {
@@ -476,6 +486,225 @@ if (name === "get_page_content") {
       } catch {
         return {
           content: [{ type: "text" as const, text: `输入失败: 找不到 ID 为 ${id} 的元素。请重新获取页面元素树。` }],
+          isError: true,
+        };
+      }
+    }
+
+    if (name === "smart_click") {
+      const text = args!.text as string;
+      const role = args?.role as string | undefined;
+      const exact = (args?.exact as boolean) ?? false;
+      const index = args?.index as number | undefined;
+
+      // 1. 根据是否传了 role 选择定位策略，含多级回退
+      let locator;
+      if (role) {
+        locator = page.getByRole(role as any, { name: text, exact });
+      } else {
+        locator = page.getByText(text, { exact });
+      }
+
+      let count = await locator.count();
+
+      // 2. Playwright locator 找到了，走标准流程
+      if (count > 0) {
+        // 多个匹配，需要消歧义
+        if (count > 1 && index === undefined) {
+          const hints: string[] = [];
+          for (let i = 0; i < Math.min(count, 5); i++) {
+            const desc = await locator.nth(i).evaluate((el: Element) => {
+              const tag = el.tagName.toLowerCase();
+              const parent = el.parentElement?.textContent?.trim().slice(0, 50) || '';
+              return `<${tag}> 上下文: "${parent}"`;
+            });
+            hints.push(`  [${i}] ${desc}`);
+          }
+          const extra = count > 5 ? `\n  ...还有 ${count - 5} 个` : '';
+          return {
+            content: [{ type: "text" as const,
+              text: `⚠️ 找到 ${count} 个匹配:\n${hints.join('\n')}${extra}\n请传入 index 参数指定。`
+            }],
+          };
+        }
+
+        // index 越界检查
+        if (index !== undefined && (index < 0 || index >= count)) {
+          return {
+            content: [{ type: "text" as const, text: `index ${index} 越界，有效范围 0~${count - 1}。` }],
+            isError: true,
+          };
+        }
+
+        // 执行点击
+        const target = index !== undefined ? locator.nth(index) : locator.first();
+        await target.waitFor({ state: 'visible', timeout: 5000 });
+        await target.click();
+        const url = page.url();
+        return {
+          content: [{ type: "text" as const,
+            text: `✅ 已点击 "${text}"${role ? ` (role=${role})` : ''} [${index ?? 0}]。当前页面: ${url}`
+          }],
+        };
+      }
+
+      // 3. Playwright locator 找不到，回退：在 DOM 中按文本搜索并用坐标点击
+      const fallbackResult = await page.evaluate((params: { searchText: string; searchRole: string | undefined; searchIndex: number }) => {
+        const { searchText, searchRole, searchIndex } = params;
+
+        // 收集所有可见元素（穿透 Shadow DOM）
+        function collectAll(root: Document | ShadowRoot): Element[] {
+          const result: Element[] = [];
+          for (const node of root.querySelectorAll('*')) {
+            if (node.shadowRoot) result.push(...collectAll(node.shadowRoot));
+            if (node.tagName.toLowerCase() === 'iframe') {
+              const doc = (node as HTMLIFrameElement).contentDocument;
+              if (doc) result.push(...collectAll(doc));
+            }
+            result.push(node);
+          }
+          return result;
+        }
+
+        function isVisible(el: Element): boolean {
+          const rect = el.getBoundingClientRect();
+          const style = window.getComputedStyle(el);
+          return rect.width > 2 && rect.height > 2
+            && style.opacity !== '0' && style.visibility !== 'hidden' && style.display !== 'none'
+            && rect.top < window.innerHeight && rect.bottom > 0;
+        }
+
+        // 按 role 过滤的选择器
+        const roleSelectors: Record<string, string> = {
+          button: 'button, [role="button"]',
+          link: 'a[href], [role="link"]',
+          tab: '[role="tab"]',
+        };
+
+        const allElements = collectAll(document);
+        const matches: Element[] = [];
+
+        for (const el of allElements) {
+          if (!isVisible(el)) continue;
+          const elText = (el as HTMLElement).innerText?.trim() || '';
+          if (!elText.includes(searchText)) continue;
+
+          // 如果指定了 role，检查是否匹配
+          if (searchRole && roleSelectors[searchRole]) {
+            if (!el.matches(roleSelectors[searchRole]!)) continue;
+          }
+
+          // 优先选择叶子级别的匹配（文本长度最短的匹配更精确）
+          matches.push(el);
+        }
+
+        // 按文本长度排序，最短的（最精确的）排前面
+        matches.sort((a, b) =>
+          ((a as HTMLElement).innerText?.length || 0) - ((b as HTMLElement).innerText?.length || 0)
+        );
+
+        if (matches.length === 0) return { found: false, count: 0 };
+
+        if (matches.length > 1 && searchIndex === -1) {
+          // 需要消歧义
+          const hints = matches.slice(0, 5).map((el, i) => {
+            const tag = el.tagName.toLowerCase();
+            const ctx = el.parentElement?.textContent?.trim().slice(0, 50) || '';
+            return `  [${i}] <${tag}> 上下文: "${ctx}"`;
+          });
+          return { found: true, count: matches.length, needDisambiguate: true, hints };
+        }
+
+        const targetIdx = searchIndex >= 0 ? searchIndex : 0;
+        if (targetIdx >= matches.length) return { found: true, count: matches.length, outOfBounds: true };
+
+        const target = matches[targetIdx]!;
+        target.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' });
+        const rect = target.getBoundingClientRect();
+        return {
+          found: true,
+          count: matches.length,
+          coords: { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 },
+        };
+      }, { searchText: text, searchRole: role, searchIndex: index ?? -1 });
+
+      if (!fallbackResult.found) {
+        return {
+          content: [{ type: "text" as const, text: role
+            ? `找不到 role="${role}"、文本含 "${text}" 的元素。`
+            : `找不到包含 "${text}" 的可见元素。`
+          }],
+          isError: true,
+        };
+      }
+
+      if (fallbackResult.needDisambiguate) {
+        const extra = fallbackResult.count! > 5 ? `\n  ...还有 ${fallbackResult.count! - 5} 个` : '';
+        return {
+          content: [{ type: "text" as const,
+            text: `⚠️ 找到 ${fallbackResult.count} 个匹配:\n${fallbackResult.hints!.join('\n')}${extra}\n请传入 index 参数指定。`
+          }],
+        };
+      }
+
+      if (fallbackResult.outOfBounds) {
+        return {
+          content: [{ type: "text" as const, text: `index ${index} 越界，有效范围 0~${fallbackResult.count! - 1}。` }],
+          isError: true,
+        };
+      }
+
+      // 用坐标真实点击
+      await page.waitForTimeout(150);
+      const coords = fallbackResult.coords!;
+      await page.mouse.click(coords.x, coords.y);
+      const url = page.url();
+      return {
+        content: [{ type: "text" as const,
+          text: `✅ 已点击 "${text}"${role ? ` (role=${role})` : ''} [${index ?? 0}]（DOM回退）。当前页面: ${url}`
+        }],
+      };
+    }
+
+    if (name === "find_text_and_scroll") {
+      const text = args!.text as string;
+      try {
+        const locator = page.getByText(text, { exact: false }).first();
+
+        const isVisible = await locator.isVisible().catch(() => false);
+        if (!isVisible) {
+          return {
+            content: [{ type: "text" as const, text: `未在当前 DOM 中找到文本: "${text}"。如果页面有无限滚动，请先调用 scroll_page 工具向下加载更多内容后重试。` }],
+          };
+        }
+
+        await locator.scrollIntoViewIfNeeded();
+
+        const elementInfo = await locator.evaluate((el) => {
+          const interactiveEl = el.closest('[data-ai-id]') || el;
+          const aiId = interactiveEl.getAttribute('data-ai-id');
+          const textContent = el.textContent?.trim().slice(0, 50);
+          return {
+            hasAiId: !!aiId,
+            aiId,
+            tagName: el.tagName.toLowerCase(),
+            text: textContent,
+          };
+        });
+
+        if (elementInfo.hasAiId) {
+          return {
+            content: [{ type: "text" as const, text: `成功找到 "${text}" 并已滚动到可视区域。目标所在的交互元素 ID 为 [${elementInfo.aiId}]，你可以直接调用 click_by_id 操作它。` }],
+          };
+        } else {
+          return {
+            content: [{ type: "text" as const, text: `成功找到 "${text}" 并已滚动到可视区域。但它似乎不是一个可交互元素（没有 ai-id），标签为 <${elementInfo.tagName}>。建议重新调用 get_interactive_tree 刷新当前视图以获取周围的可交互元素。` }],
+          };
+        }
+      } catch (error: unknown) {
+        const msg = error instanceof Error ? error.message : String(error);
+        return {
+          content: [{ type: "text" as const, text: `查找文本 "${text}" 时发生错误: ${msg}` }],
           isError: true,
         };
       }

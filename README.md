@@ -13,6 +13,8 @@
   - [浏览器连接（懒加载 + 自动启动）](#浏览器连接懒加载--自动启动)
   - [交互元素树（虚拟 Accessibility Tree）](#交互元素树虚拟-accessibility-tree)
   - [输入框兼容性处理](#输入框兼容性处理)
+  - [智能文本点击（smart_click）](#智能文本点击smart_click)
+  - [文本定位与滚动（find_text_and_scroll）](#文本定位与滚动find_text_and_scroll)
   - [滚动策略](#滚动策略)
 - [配置与部署](#配置与部署)
   - [环境要求](#环境要求)
@@ -25,15 +27,18 @@
 
 ## 功能清单
 
-项目暴露 **6 个 MCP Tools**，无 Resources 和 Prompts。
+项目暴露 **9 个 MCP Tools**，无 Resources 和 Prompts。
 
 | Tool | 功能 | 必填参数 |
 |---|---|---|
 | `navigate` | 导航到指定 URL | `url: string` |
+| `click_element` | 通过 CSS 选择器点击元素 | `selector: string` |
 | `get_page_content` | 获取页面纯文本（截断 5000 字符） | 无 |
 | `get_interactive_tree` | 扫描所有可交互元素，返回带编号列表，并在页面叠加蓝色标注框 | 无 |
 | `click_by_id` | 通过数字 ID 点击元素，含探针检测遮挡 + el.click() + 物理补点 | `id: number` |
 | `type_by_id` | 通过数字 ID 定位输入框，清空后逐字输入文本 | `id: number`, `text: string` |
+| `smart_click` | 通过可见文本点击元素，支持 ARIA role 过滤和多匹配消歧义 | `text: string`；可选 `role`, `exact`, `index` |
+| `find_text_and_scroll` | 在页面中查找指定文本并自动滚动到可视区域，返回交互信息 | `text: string` |
 | `scroll_page` | 滚动页面，自动检测可滚动容器或回退到鼠标滚轮 | 可选 `pixels: number` |
 
 ---
@@ -98,6 +103,22 @@ Claude Desktop / Claude Code
 - 通过原型链获取 `value` 的**原生 setter** 清空内容（绕过 React/Vue 的合成事件机制）
 - 手动触发 `input` 和 `change` 事件确保框架感知
 - 使用 `keyboard.type()` 逐字输入保证 `isTrusted = true`
+
+### 智能文本点击（smart_click）
+
+基于 Playwright 原生定位器的**多级回退策略**：
+
+1. **Playwright locator** — 优先使用 `getByRole()` 或 `getByText()` 精准定位
+2. **多匹配消歧义** — 匹配多个时返回上下文列表，由调用方传 `index` 指定
+3. **DOM 回退** — locator 找不到时，在 DOM 中按文本搜索（穿透 Shadow DOM），定位后用坐标物理点击
+
+### 文本定位与滚动（find_text_and_scroll）
+
+利用 Playwright 的 `getByText()` 原生文本定位能力：
+
+1. **模糊匹配** — `page.getByText(text, { exact: false })` 查找包含指定文本的元素
+2. **自动滚动** — 调用 `scrollIntoViewIfNeeded()` 将目标滚动到视口中央
+3. **交互信息返回** — 检查目标元素或其祖先是否有 `data-ai-id`，有则直接返回 ID 供后续 `click_by_id` 使用
 
 ### 滚动策略
 
